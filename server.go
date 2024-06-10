@@ -2,10 +2,16 @@ package main
 
 import (
 	"context"
+	"encoding/binary"
+	"errors"
 	"fmt"
 	"github.com/rij12/RPJCache/cache"
+	"github.com/rij12/RPJCache/client"
+	"github.com/rij12/RPJCache/proto"
+	"io"
 	"log"
 	"net"
+	"time"
 )
 
 type ServerOpts struct {
@@ -18,7 +24,7 @@ type Server struct {
 	ServerOpts ServerOpts
 	cache      cache.Cacher
 
-	followers map[net.Conn]struct{}
+	members map[*client.Client]struct{}
 }
 
 func NewService(opts ServerOpts, c cache.Cacher) *Server {
@@ -26,7 +32,7 @@ func NewService(opts ServerOpts, c cache.Cacher) *Server {
 		ServerOpts: opts,
 		cache:      c,
 		// TODO: only allocate this when we are the leader
-		followers: make(map[net.Conn]struct{}),
+		members: make(map[*client.Client]struct{}),
 	}
 }
 func (s *Server) start() error {
@@ -35,6 +41,15 @@ func (s *Server) start() error {
 		return fmt.Errorf("failed to listen: %s", err)
 	}
 	log.Printf("serving on [%s]", s.ServerOpts.listenAddr)
+
+	if !s.ServerOpts.IsLeader {
+		go func() {
+			err := s.dialLeader()
+			if err != nil {
+				log.Println(err)
+			}
+		}()
+	}
 
 	for {
 		conn, err := ln.Accept()
@@ -48,74 +63,88 @@ func (s *Server) start() error {
 
 }
 
-func (s *Server) handleConn(conn net.Conn) {
-	defer func() {
-		_ = conn.Close()
-	}()
-	buf := make([]byte, 2048)
-	for {
-		_, err := conn.Read(buf)
-		if err != nil {
-			log.Printf("read error: %s\n", err)
-			break
-		}
-		go s.handleCommand(conn, buf)
-	}
-}
-
-func (s *Server) handleCommand(conn net.Conn, rawCmd []byte) {
-	msg, err := parseMessage(rawCmd)
+func (s *Server) dialLeader() error {
+	conn, err := net.Dial("tcp", s.ServerOpts.LeaderAddr)
 	if err != nil {
-		print("failed to parseMessage: %s\n", err)
-		log.Println("failed to parse command", msg)
-		_, _ = conn.Write([]byte(err.Error()))
-		return
+		return fmt.Errorf("failed to connect to leader: %s", err)
 	}
+	log.Println("connected with leader")
 
-	fmt.Println("Received command: ", msg.Cmd)
-
-	switch msg.Cmd {
-	case CMDSet:
-		err = s.handleSetCommand(conn, msg)
-	case CMDGet:
-		err = s.handleGetCommand(conn, msg)
-	}
-
+	err = binary.Write(conn, binary.LittleEndian, proto.CmdJoin)
 	if err != nil {
-		log.Println("failed to parse command", msg, err)
-		_, _ = conn.Write([]byte(err.Error()))
-		return
-	}
-}
-
-func (s *Server) handleGetCommand(conn net.Conn, msg *Message) error {
-	val, err := s.cache.Get(msg.Key)
-	if err != nil {
+		log.Printf("failed to send command to leader: %s", err)
 		return err
 	}
-	_, err = conn.Write(val)
+
+	s.handleConn(conn)
+	return nil
+}
+
+func (s *Server) handleConn(conn net.Conn) {
+	defer conn.Close()
+	for {
+		cmd, err := proto.ParseCommand(conn)
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			log.Printf("failed to parse command: %s", err)
+			break
+		}
+		go s.handleCommand(conn, cmd)
+	}
+}
+
+func (s *Server) handleCommand(conn net.Conn, cmd any) {
+	switch v := cmd.(type) {
+	case *proto.CommandGet:
+		s.handleGetCommand(conn, v)
+	case *proto.CommandSet:
+		s.handleSetCommand(conn, v)
+	case *proto.CommandJoin:
+		s.handleJoinCommand(conn, v)
+	}
+}
+
+func (s *Server) handleJoinCommand(conn net.Conn, cmd *proto.CommandJoin) error {
+	log.Printf("member joined server: [%s]", conn.RemoteAddr())
+	s.members[client.NewClientFromConn(conn)] = struct{}{}
+	return nil
+}
+
+func (s *Server) handleSetCommand(conn net.Conn, cmd *proto.CommandSet) error {
+	log.Printf("Set %s to %s", cmd.Key, cmd.Value)
+	// Not Thread Safe
+	go func() {
+		for m := range s.members {
+			err := m.Set(context.TODO(), cmd.Key, cmd.Value, cmd.TTL)
+			if err != nil {
+				log.Println(err)
+			}
+		}
+	}()
+
+	resp := proto.ResponseSet{}
+	if err := s.cache.Set(cmd.Key, cmd.Value, time.Duration(cmd.TTL)); err != nil {
+		resp.Status = proto.StatusError
+		_, err = conn.Write(resp.Bytes())
+		return err
+	}
+	resp.Status = proto.StatusOk
+	_, err := conn.Write(resp.Bytes())
 	return err
 }
 
-func (s *Server) handleSetCommand(conn net.Conn, msg *Message) error {
-	if err := s.cache.Set(msg.Key, msg.Value, msg.TTL); err != nil {
+func (s *Server) handleGetCommand(conn net.Conn, cmd *proto.CommandGet) error {
+	resp := proto.ResponseGet{}
+	value, err := s.cache.Get(cmd.Key)
+	if err != nil {
+		resp.Status = proto.StatusError
+		_, err = conn.Write(resp.Bytes())
 		return err
 	}
-
-	go s.sendToFollowers(context.TODO())
-
-	return nil
-}
-
-func (s *Server) sendToFollowers(ctx context.Context, msg *Message) error {
-	// TODO: Fix Lock protection
-	for conn := range s.followers {
-		_, err := conn.Write(msg.ToBytes())
-		if err != nil {
-			log.Printf("write error: %s\n", err)
-			continue
-		}
-	}
-
-	return nil
+	resp.Status = proto.StatusOk
+	resp.Value = value
+	_, err = conn.Write(resp.Bytes())
+	return err
 }

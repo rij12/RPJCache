@@ -2,7 +2,6 @@ package cache
 
 import (
 	"fmt"
-	"log"
 	"sync"
 	"time"
 )
@@ -22,16 +21,12 @@ func (c *Cache) Get(key []byte) ([]byte, error) {
 	c.lock.RLock()
 	defer c.lock.RUnlock()
 
-	log.Printf("get key: [%s]", string(key))
-
 	keyStr := string(key)
 
 	val, ok := c.data[keyStr]
 	if !ok {
 		return nil, fmt.Errorf("key [%s] not found", keyStr)
 	}
-
-	log.Printf("got key: [%s], and value: [%s]", string(key), string(val))
 
 	return val, nil
 }
@@ -41,13 +36,14 @@ func (c *Cache) Set(key, value []byte, ttl time.Duration) error {
 	defer c.lock.Unlock()
 
 	c.data[string(key)] = value
-	log.Printf("set key: [%s], and value: [%s]", string(key), string(value))
 
-	ticker := time.NewTicker(ttl)
-	go func() {
-		<-ticker.C
-		delete(c.data, string(key))
-	}()
+	// Todo: maybe refactor this, to have a sweep
+	if ttl > 0 {
+		go func() {
+			<-time.After(ttl)
+			delete(c.data, string(key))
+		}()
+	}
 
 	return nil
 }

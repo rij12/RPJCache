@@ -1,44 +1,61 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"github.com/rij12/RPJCache/cache"
+	"github.com/rij12/RPJCache/client"
 	"log"
-	"net"
 	"time"
 )
 
 func main() {
-	var (
-		listenAddr = flag.String("listenAddr", ":8080", "listen address of the server")
-		leaderAddr = flag.String("leaderAddr", "", "listen address of the leader")
-	)
+	listenAddr := flag.String("listenaddr", ":3000", "listen address of the server")
+	leaderAddr := flag.String("leaderaddr", "", "listen address of the leader")
+
 	flag.Parse()
 
 	opts := ServerOpts{
 		listenAddr: *listenAddr,
-		IsLeader:   true,
+		IsLeader:   len(*leaderAddr) == 0,
 		LeaderAddr: *leaderAddr,
 	}
 
 	go func() {
-		time.Sleep(time.Second * 2)
-		conn, err := net.Dial("tcp", ":3000")
-		if err != nil {
-			log.Fatal(err)
+		time.Sleep(time.Second * 10)
+		if opts.IsLeader {
+			sendData()
 		}
-		_, _ = conn.Write([]byte("SET Foo Bar 2500"))
-
-		time.Sleep(time.Second * 2)
-		_, _ = conn.Write([]byte("GET Foo"))
-
-		buf := make([]byte, 1000)
-		n, _ := conn.Read(buf)
-		fmt.Println(string(buf[:n]))
-
 	}()
 
 	server := NewService(opts, cache.New())
-	server.start()
+	err := server.start()
+	if err != nil {
+		log.Fatalf(err.Error())
+	}
+}
+
+func sendData() {
+	for i := 0; i < 100; i++ {
+		go func(i int) {
+			time.Sleep(time.Second * 2)
+			c, err := client.New(":3000")
+			if err != nil {
+				log.Fatal(err)
+			}
+			key := []byte(fmt.Sprintf("key_%d", i))
+			value := []byte(fmt.Sprintf("val_%d", i))
+			err = c.Set(context.Background(), key, value, 0)
+			if err != nil {
+				log.Fatal(err)
+			}
+			fetchedValue, err := c.Get(context.Background(), key)
+			if err != nil {
+				log.Fatal(err)
+			}
+			fmt.Println(string(fetchedValue))
+			c.Close()
+		}(i)
+	}
 }

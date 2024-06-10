@@ -5,5 +5,8 @@ run: build
 	 ./bin/rpjcache
 
 runfollower: build
-	./bin/rpjcache --listenAddr :4000 --leaderAddr :3000
+	./bin/rpjcache --listenaddr :4000 --leaderaddr :3000
+
+test:
+	go test -v ./...
 
